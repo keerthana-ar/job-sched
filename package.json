@@ -1,0 +1,26 @@
+{
+  "name": "aethersched",
+  "version": "1.0.0",
+  "description": "Fault-tolerant distributed job scheduler with atomic lookahead, lease-based execution, chaos resilience, and live observability",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "tsx --test tests/**/*.test.ts"
+  },
+  "keywords": ["distributed-systems", "job-scheduler", "concurrency", "fault-tolerance", "redis", "system-design"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cron-parser": "^4.9.0",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

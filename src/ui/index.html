@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AetherSched — Distributed Job Scheduling Platform</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-background"></div>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <div class="logo-badge">
+        <div class="logo-pulse"></div>
+        <span class="logo-text">AETHERSCHED</span>
+      </div>
+      <div class="cluster-pill">
+        <span class="pulse-dot"></span>
+        <span id="clusterStatusText">CLUSTER ACTIVE</span>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="time-display" id="systemClock">--:--:-- UTC</div>
+      <button class="btn btn-outline btn-sm" id="btnRefreshJobs">⟳ Refresh</button>
+      <a href="#chaosSection" class="btn btn-chaos btn-sm">⚡ Chaos Console</a>
+    </div>
+  </header>
+
+  <!-- Metric Badges Row -->
+  <section class="metrics-grid">
+    <div class="metric-card">
+      <div class="metric-label">Total Jobs</div>
+      <div class="metric-value" id="metricTotalJobs">0</div>
+      <div class="metric-sub" id="metricJobBreakdown">0 sched · 0 run · 0 succ</div>
+    </div>
+    <div class="metric-card highlight-blue">
+      <div class="metric-label">Active Schedulers</div>
+      <div class="metric-value" id="metricSchedulers">0 / 0</div>
+      <div class="metric-sub">Atomic Lookahead Polling</div>
+    </div>
+    <div class="metric-card highlight-emerald">
+      <div class="metric-label">Worker Fleet</div>
+      <div class="metric-value" id="metricWorkers">0 / 0</div>
+      <div class="metric-sub">Lease-Fenced Concurrency</div>
+    </div>
+    <div class="metric-card highlight-amber">
+      <div class="metric-label">Running Leases</div>
+      <div class="metric-value" id="metricRunningLeases">0</div>
+      <div class="metric-sub">Auto-Heartbeated</div>
+    </div>
+    <div class="metric-card highlight-rose">
+      <div class="metric-label">Dead Letter Queue</div>
+      <div class="metric-value" id="metricDlqCount">0</div>
+      <div class="metric-sub">Poison-Pill Quarantine</div>
+    </div>
+  </section>
+
+  <!-- Topology View: Schedulers & Workers Fleet -->
+  <section class="topology-section">
+    <div class="section-header">
+      <h2 class="section-title">Distributed Cluster Topology</h2>
+      <span class="section-subtitle">Real-time Node Heartbeats & Lease Management</span>
+    </div>
+    <div class="topology-grid">
+      <!-- Schedulers Column -->
+      <div class="topology-col">
+        <div class="col-title"><span class="icon">⛯</span> Scheduler Nodes (Atomic Poller)</div>
+        <div class="nodes-container" id="schedulersContainer">
+          <!-- Rendered dynamically -->
+        </div>
+      </div>
+
+      <!-- Workers Column -->
+      <div class="topology-col">
+        <div class="col-title"><span class="icon">⚙</span> Worker Fleet (Leased Execution)</div>
+        <div class="nodes-container" id="workersContainer">
+          <!-- Rendered dynamically -->
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Main Content Grid -->
+  <main class="main-grid">
+    <!-- Left Column: Job Creator & Chaos Control -->
+    <div class="left-col">
+      <!-- Job Submission Card -->
+      <div class="card">
+        <div class="card-header">
+          <h3>Create & Schedule Job</h3>
+          <span class="badge">API v1</span>
+        </div>
+        <form id="jobForm" class="job-form">
+          <div class="form-group">
+            <label for="jobName">Job Identifier Name</label>
+            <input type="text" id="jobName" required placeholder="e.g. Stripe-Invoice-Settlement" value="Billing-Sync-Job">
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="taskType">Task Handler</label>
+              <select id="taskType">
+                <option value="DATA_PROCESSING">Data Processing (Batch)</option>
+                <option value="HTTP_WEBHOOK">HTTP Webhook (Downstream)</option>
+                <option value="EMAIL_DISPATCH">Email Notification</option>
+                <option value="DB_CLEANUP">Database Cleanup</option>
+                <option value="FLAKY_TASK">Flaky Task (Backoff Demo)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="jobPriority">Priority</label>
+              <select id="jobPriority">
+                <option value="CRITICAL">Critical (P0)</option>
+                <option value="HIGH">High (P1)</option>
+                <option value="NORMAL" selected>Normal (P2)</option>
+                <option value="LOW">Low (P3)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="scheduleType">Schedule Mode</label>
+              <select id="scheduleType">
+                <option value="IMMEDIATE">Run Immediately</option>
+                <option value="DELAYED">Delayed (Future)</option>
+                <option value="CRON">Recurring Cron</option>
+              </select>
+            </div>
+            <div class="form-group" id="delayGroup" style="display:none;">
+              <label for="delaySeconds">Delay (seconds)</label>
+              <input type="number" id="delaySeconds" value="5" min="1" max="3600">
+            </div>
+            <div class="form-group" id="cronGroup" style="display:none;">
+              <label for="cronExpr">Cron Expression</label>
+              <input type="text" id="cronExpr" value="*/10 * * * * *" placeholder="*/10 * * * * *">
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="maxRetries">Max Retries</label>
+              <input type="number" id="maxRetries" value="3" min="0" max="10">
+            </div>
+            <div class="form-group">
+              <label for="baseDelayMs">Base Backoff (ms)</label>
+              <input type="number" id="baseDelayMs" value="1500" step="500">
+            </div>
+          </div>
+
+          <button type="submit" id="btnSubmitJob" class="btn btn-primary btn-block">
+            Schedule Distributed Job ➔
+          </button>
+        </form>
+      </div>
+
+      <!-- Chaos Engineering Console -->
+      <div class="card chaos-card" id="chaosSection">
+        <div class="card-header">
+          <div class="chaos-title-wrap">
+            <span class="chaos-flame">🔥</span>
+            <h3>Chaos Engineering Console</h3>
+          </div>
+          <span class="badge badge-chaos">Fault Injection</span>
+        </div>
+        <p class="chaos-desc">
+          Test system resiliency under real-world catastrophic failure modes:
+        </p>
+
+        <div class="chaos-actions">
+          <div class="chaos-action-item">
+            <div class="chaos-info">
+              <strong>Kill Worker Mid-Execution</strong>
+              <span>Simulates SIGKILL on worker host. Tests lease expiration and Zombie Reaper auto-reclamation.</span>
+            </div>
+            <button class="btn btn-sm btn-danger" id="btnChaosKillWorker">Kill Worker-1</button>
+          </div>
+
+          <div class="chaos-action-item">
+            <div class="chaos-info">
+              <strong>Revive Killed Worker</strong>
+              <span>Restores crashed worker back into the healthy worker pool.</span>
+            </div>
+            <button class="btn btn-sm btn-emerald" id="btnChaosReviveWorker">Revive Worker-1</button>
+          </div>
+
+          <div class="chaos-action-item">
+            <div class="chaos-info">
+              <strong>Traffic Avalanche (50 Jobs)</strong>
+              <span>Dumps 50 concurrent jobs to test queue concurrency and scheduler batching.</span>
+            </div>
+            <button class="btn btn-sm btn-amber" id="btnChaosSpike">Trigger Burst</button>
+          </div>
+
+          <div class="chaos-action-item">
+            <div class="chaos-info">
+              <strong>Cascade Flaky Failure & DLQ</strong>
+              <span>Injects jobs that fail initially to demonstrate exponential backoff jitter and DLQ quarantine.</span>
+            </div>
+            <button class="btn btn-sm btn-outline" id="btnChaosFlaky">Trigger Flaky</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Column: Live Executions, DLQ, and Logs -->
+    <div class="right-col">
+      <!-- Live Job Execution Stream -->
+      <div class="card">
+        <div class="card-header">
+          <h3>Live Jobs & Execution Stream</h3>
+          <span class="live-tag">● LIVE STREAM</span>
+        </div>
+        <div class="table-container">
+          <table class="jobs-table">
+            <thead>
+              <tr>
+                <th>Job Name</th>
+                <th>Type</th>
+                <th>Priority</th>
+                <th>Schedule</th>
+                <th>Status</th>
+                <th>Attempt</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="jobsTableBody">
+              <!-- Rendered dynamically -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Dead Letter Queue (DLQ) Inspector -->
+      <div class="card dlq-card">
+        <div class="card-header">
+          <div class="dlq-header-title">
+            <span class="icon">☠</span>
+            <h3>Dead Letter Queue (Quarantine)</h3>
+          </div>
+          <span class="badge badge-rose" id="dlqBadge">0 Poisoned Jobs</span>
+        </div>
+        <div class="dlq-container" id="dlqContainer">
+          <div class="empty-state">No failed poisoned pills in Dead Letter Queue. System is healthy!</div>
+        </div>
+      </div>
+
+      <!-- Cluster Event & Audit Log Stream -->
+      <div class="card log-card">
+        <div class="card-header">
+          <h3>Distributed Cluster Event Log</h3>
+          <button class="btn btn-ghost btn-xs" id="btnClearLogs">Clear</button>
+        </div>
+        <div class="log-stream" id="logStream">
+          <!-- Streamed live via SSE -->
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <footer class="footer">
+    <span>AetherSched Distributed Architecture Demo · At-Least-Once Delivery · Leased Fencing · Zero Duplication</span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
