@@ -1,10 +1,150 @@
+version: '3.8'
+
 services:
-  aethersched:
+  # 1. High-Performance Redis with AOF & RDB Persistence Enabled
+  redis:
+    image: redis:7-alpine
+    container_name: aethersched-redis
+    command: redis-server --appendonly yes --appendfsync everysec --save 60 1
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # 2. Schedulers (2 Shards/Replicas with Atomic Lookahead Claiming)
+  scheduler-1:
     build: .
-    container_name: aethersched-cluster
+    container_name: aethersched-scheduler-1
+    command: node dist/bin/scheduler.js --id=Scheduler-1
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - NODE_ID=Scheduler-1
+      - POLL_INTERVAL_MS=300
+      - BATCH_SIZE=50
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  scheduler-2:
+    build: .
+    container_name: aethersched-scheduler-2
+    command: node dist/bin/scheduler.js --id=Scheduler-2
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - NODE_ID=Scheduler-2
+      - POLL_INTERVAL_MS=300
+      - BATCH_SIZE=50
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 3. Workers (3 Autonomous Daemons with Leases & Fencing Tokens)
+  worker-1:
+    build: .
+    container_name: aethersched-worker-1
+    command: node dist/bin/worker.js --id=Worker-1
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - NODE_ID=Worker-1
+      - CONCURRENCY=4
+      - LEASE_TTL_MS=4000
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-2:
+    build: .
+    container_name: aethersched-worker-2
+    command: node dist/bin/worker.js --id=Worker-2
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - NODE_ID=Worker-2
+      - CONCURRENCY=4
+      - LEASE_TTL_MS=4000
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-3:
+    build: .
+    container_name: aethersched-worker-3
+    command: node dist/bin/worker.js --id=Worker-3
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - NODE_ID=Worker-3
+      - CONCURRENCY=4
+      - LEASE_TTL_MS=4000
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 4. Zombie Reaper / Scavenger (Reclaims Expired Leases & Bumps Fencing Tokens)
+  reaper:
+    build: .
+    container_name: aethersched-reaper
+    command: node dist/bin/reaper.js
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - REAPER_SCAN_INTERVAL_MS=1500
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 5. REST API, Prometheus Metrics, & Live Observability Dashboard
+  api:
+    build: .
+    container_name: aethersched-api
     ports:
       - "4000:4000"
     environment:
       - PORT=4000
+      - REDIS_URL=redis://redis:6379
       - NODE_ENV=production
+      - AETHERSCHED_API_KEY=aether-secret-key-prod
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
+
+  # 6. Prometheus Metrics Scraper
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    container_name: aethersched-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # 7. Grafana Dashboards
+  grafana:
+    image: grafana/grafana:10.3.0
+    container_name: aethersched-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  redis_data:

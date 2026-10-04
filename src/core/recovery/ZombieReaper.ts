@@ -45,10 +45,13 @@ export class ZombieReaper {
   }
 
   private async reclaimZombieJob(jobId: string, deadWorkerId: string, startedAt: number, now: number): Promise<void> {
-    // 1. Remove expired lease
+    // 1. Advance fencing token so any zombie worker waking up late is rejected
+    const newFencingToken = await this.storage.incrementFencingToken(jobId);
+
+    // 2. Remove expired lease
     await this.storage.removeLease(jobId);
 
-    // 2. Fetch job
+    // 3. Fetch job
     const jobJson = await this.storage.get(`job:${jobId}`);
     if (!jobJson) return;
 
@@ -62,8 +65,8 @@ export class ZombieReaper {
     ClusterBus.getInstance().emit(
       'CHAOS',
       'ZombieReaper',
-      `🧟 ZOMBIE JOB RECLAIMED: Worker ${deadWorkerId} crashed mid-execution on job ${job.name} (${job.id}). Lease expired! Reclaiming and rescheduling...`,
-      { jobId: job.id, deadWorkerId }
+      `🧟 ZOMBIE JOB RECLAIMED: Worker ${deadWorkerId} timed out on job ${job.name} (${job.id}). Fencing token advanced to ${newFencingToken}. Rescheduling...`,
+      { jobId: job.id, deadWorkerId, fencingToken: newFencingToken }
     );
 
     const execRecord: JobExecutionRecord = {

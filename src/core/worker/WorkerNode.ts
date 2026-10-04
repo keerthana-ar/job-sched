@@ -10,9 +10,16 @@ export class WorkerNode {
   private pollTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private leaseRenewTimer: NodeJS.Timeout | null = null;
-  private activeJobsMap = new Map<string, { job: Job; startTime: number; leaseId: string }>();
+  private activeJobsMap = new Map<string, { job: Job; startTime: number; leaseId: string; fencingToken: number }>();
 
   private readyQueueKey = 'queue:ready_jobs';
+  private priorityQueueKeys = [
+    'queue:ready_jobs:CRITICAL',
+    'queue:ready_jobs:HIGH',
+    'queue:ready_jobs:NORMAL',
+    'queue:ready_jobs:LOW',
+    'queue:ready_jobs',
+  ];
   private leaseTtlMs: number;
 
   constructor(
@@ -36,6 +43,28 @@ export class WorkerNode {
     };
   }
 
+  // Lease extension loop: renew active leases every 1.5s
+  private setupLeaseRenewal(): void {
+    this.leaseRenewTimer = setInterval(async () => {
+      if (this.info.status === 'CRASHED' || this.info.status === 'DEAD') {
+        return; // If crashed, STOP renewing lease so it expires!
+      }
+      const now = Date.now();
+      for (const [jobId, item] of this.activeJobsMap.entries()) {
+        const lease: ExecutionLease = {
+          jobId,
+          workerId: this.id,
+          leaseId: item.leaseId,
+          fencingToken: item.fencingToken,
+          grantedAt: item.startTime,
+          expiresAt: now + this.leaseTtlMs,
+          renewCount: 1,
+        };
+        await this.storage.setLease(lease);
+      }
+    }, 1500);
+  }
+
   public async start(): Promise<void> {
     if (this.isRunning) return;
     this.isRunning = true;
@@ -50,104 +79,121 @@ export class WorkerNode {
       }
     }, 1000);
 
-    // Lease extension loop: renew active leases every 1.5s
-    this.leaseRenewTimer = setInterval(async () => {
-      if (this.info.status === 'CRASHED' || this.info.status === 'DEAD') {
-        return; // If crashed, STOP renewing lease so it expires!
-      }
-      const now = Date.now();
-      for (const [jobId, item] of this.activeJobsMap.entries()) {
-        const lease: ExecutionLease = {
-          jobId,
-          workerId: this.id,
-          leaseId: item.leaseId,
-          grantedAt: item.startTime,
-          expiresAt: now + this.leaseTtlMs,
-          renewCount: 1,
-        };
-        await this.storage.setLease(lease);
-      }
-    }, 1500);
+    this.setupLeaseRenewal();
 
-    // Polling loop for ready queue
+    // Polling loop for ready queues with priority ordering
     this.pollTimer = setInterval(async () => {
       if (!this.isRunning || this.info.status === 'CRASHED' || this.info.status === 'DEAD') {
         return;
       }
-      if (this.activeJobsMap.size >= this.info.concurrency) {
-        this.info.status = 'BUSY';
-        return;
-      } else {
-        this.info.status = 'HEALTHY';
+      while (
+        this.isRunning &&
+        (this.info.status as string) !== 'CRASHED' &&
+        (this.info.status as string) !== 'DEAD' &&
+        this.activeJobsMap.size < this.info.concurrency
+      ) {
+        const popped = await this.pullAndProcessJob();
+        if (!popped) break;
       }
-
-      await this.pullAndProcessJob();
-    }, 200);
+    }, 50);
   }
 
-  private async pullAndProcessJob(): Promise<void> {
-    const jobId = await this.storage.lpop(this.readyQueueKey);
-    if (!jobId) return;
+  private async pullAndProcessJob(): Promise<boolean> {
+    if (this.activeJobsMap.size >= this.info.concurrency) {
+      this.info.status = 'BUSY';
+      return false;
+    } else {
+      this.info.status = 'HEALTHY';
+    }
+
+    // 1. Pop from highest priority queue available
+    const popResult = await this.storage.lpopPriority(this.priorityQueueKeys);
+    if (!popResult) return false;
+    const jobId = popResult.item;
 
     const jobJson = await this.storage.get(`job:${jobId}`);
-    if (!jobJson) return;
+    if (!jobJson) return false;
 
     const job: Job = JSON.parse(jobJson);
     if (job.status === 'CANCELLED' || job.status === 'PAUSED') {
       ClusterBus.getInstance().emit('INFO', this.id, `Skipping job ${job.id} as it is ${job.status}`);
-      return;
+      return true;
     }
 
     const leaseId = 'lease_' + Math.random().toString(36).substring(2, 9);
     const now = Date.now();
 
-    // 1. Grant execution lease
+    // 2. Grant execution lease with monotonically increasing fencing token
+    const fencingToken = await this.storage.incrementFencingToken(job.id);
     const lease: ExecutionLease = {
       jobId: job.id,
       workerId: this.id,
       leaseId,
+      fencingToken,
       grantedAt: now,
       expiresAt: now + this.leaseTtlMs,
       renewCount: 0,
     };
     await this.storage.setLease(lease);
 
-    // 2. Mark job state RUNNING
+    // 3. Mark job state RUNNING
     job.status = 'RUNNING';
     job.updatedAt = now;
     await this.storage.set(`job:${job.id}`, JSON.stringify(job));
 
-    this.activeJobsMap.set(job.id, { job, startTime: now, leaseId });
+    this.activeJobsMap.set(job.id, { job, startTime: now, leaseId, fencingToken });
     this.info.activeJobs = Array.from(this.activeJobsMap.keys());
 
     ClusterBus.getInstance().emit(
       'INFO',
       this.id,
-      `Acquired lease on job ${job.name} (${job.id}). Commencing execution...`
+      `Acquired lease (token=${fencingToken}) on job ${job.name} (${job.id}). Commencing execution...`
     );
 
-    // Execute asynchronously
-    this.executeJob(job, leaseId, now);
+    // Execute asynchronously (non-blocking)
+    this.executeJob(job, leaseId, fencingToken, now);
+    return true;
   }
 
-  private async executeJob(job: Job, leaseId: string, startTime: number): Promise<void> {
+  private async executeJob(job: Job, leaseId: string, fencingToken: number, startTime: number): Promise<void> {
     const execId = 'exec_' + Math.random().toString(36).substring(2, 9);
     const executionRecord: JobExecutionRecord = {
       id: execId,
       jobId: job.id,
       workerId: this.id,
       attempt: job.currentAttempt + 1,
+      fencingToken,
       startTime,
       status: 'SUCCESS',
     };
 
     try {
-      // Execute the task registered handler
-      const res = await TaskRegistry.execute(job);
+      let taskResult: any;
+
+      // 4. Idempotency Check: if job specifies idempotencyKey and was already executed, return cached result
+      const effectiveIdempKey = job.idempotencyKey || (job.payload && job.payload.idempotencyKey);
+      if (effectiveIdempKey) {
+        const cached = await this.storage.getIdempotency(effectiveIdempKey);
+        if (cached) {
+          ClusterBus.getInstance().emit(
+            'INFO',
+            this.id,
+            `🔁 Idempotency hit: Job ${job.id} with key '${effectiveIdempKey}' already completed. Using cached result.`
+          );
+          taskResult = JSON.parse(cached);
+        }
+      }
+
+      if (taskResult === undefined) {
+        // Execute the registered task handler
+        const res = await TaskRegistry.execute(job);
+        taskResult = res.result;
+      }
+
       const endTime = Date.now();
       executionRecord.endTime = endTime;
       executionRecord.durationMs = endTime - startTime;
-      executionRecord.result = res.result;
+      executionRecord.result = taskResult;
 
       // Ensure worker didn't crash while processing
       if (this.info.status === 'CRASHED' || this.info.status === 'DEAD') {
@@ -155,14 +201,39 @@ export class WorkerNode {
         return; // Do not commit success, let scavenger handle it
       }
 
+      // 5. Atomic Completion with Fencing Token Verification
+      // If a zombie reaper reassigned the job while we were slow/paused, our fencingToken will be stale!
+      job.updatedAt = Date.now();
+      job.executionHistory.push(executionRecord);
+      if (job.schedule.type !== 'CRON' || !job.schedule.cronExpr) {
+        job.status = 'SUCCESS';
+      }
+
+      const atomicResult = await this.storage.completeJobAtomic(
+        job.id,
+        fencingToken,
+        JSON.stringify(job),
+        effectiveIdempKey,
+        JSON.stringify(taskResult)
+      );
+
+      if (!atomicResult.success) {
+        // FENCING TOKEN STALE REJECTION!
+        ClusterBus.getInstance().emit(
+          'WARN',
+          this.id,
+          `⛔ Fencing rejection on job ${job.id}: ${atomicResult.reason}. Write rejected to prevent split-brain state overwrite!`
+        );
+        return;
+      }
+
       this.info.totalExecuted += 1;
-      await this.storage.removeLease(job.id);
       await RetryManager.handleSuccess(this.storage, job, executionRecord);
 
       ClusterBus.getInstance().emit(
         'INFO',
         this.id,
-        `✅ Job ${job.name} (${job.id}) completed successfully in ${executionRecord.durationMs}ms.`
+        `✅ Job ${job.name} (${job.id}) completed successfully in ${executionRecord.durationMs}ms (fencing token=${fencingToken}).`
       );
     } catch (err: any) {
       const endTime = Date.now();
@@ -179,6 +250,9 @@ export class WorkerNode {
     } finally {
       this.activeJobsMap.delete(job.id);
       this.info.activeJobs = Array.from(this.activeJobsMap.keys());
+      if (this.isRunning && this.info.status !== 'CRASHED' && this.info.status !== 'DEAD' && this.activeJobsMap.size < this.info.concurrency) {
+        setImmediate(() => this.pullAndProcessJob());
+      }
     }
   }
 

@@ -47,6 +47,7 @@ export interface Job {
   nextRunTime: number;      // Epoch ms when job should execute
   createdAt: number;
   updatedAt: number;
+  idempotencyKey?: string;  // Unique client key for deduplication and at-least-once safety
   lastExecutionId?: string;
   lastError?: string;
   executionHistory: JobExecutionRecord[];
@@ -57,6 +58,7 @@ export interface JobExecutionRecord {
   jobId: string;
   workerId: string;
   attempt: number;
+  fencingToken?: number;    // Monotonically increasing lease token
   startTime: number;
   endTime?: number;
   durationMs?: number;
@@ -69,6 +71,7 @@ export interface ExecutionLease {
   jobId: string;
   workerId: string;
   leaseId: string;
+  fencingToken: number;     // Monotonically increasing generation number (prevents zombie split-brain)
   grantedAt: number;
   expiresAt: number;
   renewCount: number;

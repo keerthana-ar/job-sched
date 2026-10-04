@@ -5,6 +5,8 @@ import { fileURLToPath } from 'url';
 import { ClusterManager } from '../core/ClusterManager.js';
 import { ClusterBus } from '../core/ClusterBus.js';
 import { ChaosEngine } from '../core/chaos/ChaosEngine.js';
+import { createAuthMiddleware } from './auth.js';
+import { register, jobsEnqueuedCounter } from '../monitoring/metrics.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,6 +18,33 @@ export function createApp() {
 
   app.use(express.json());
 
+  // Prometheus Metrics endpoint
+  app.get('/metrics', async (_req: Request, res: Response) => {
+    try {
+      res.setHeader('Content-Type', register.contentType);
+      res.send(await register.metrics());
+    } catch (err: any) {
+      res.status(500).send(err.message);
+    }
+  });
+
+  // Health Check endpoint
+  app.get('/health', async (_req: Request, res: Response) => {
+    try {
+      res.json({
+        status: 'UP',
+        timestamp: Date.now(),
+        uptime: process.uptime(),
+        memoryUsage: process.memoryUsage(),
+      });
+    } catch (err: any) {
+      res.status(500).json({ status: 'DOWN', error: err.message });
+    }
+  });
+
+  // Apply API Auth Middleware
+  app.use(createAuthMiddleware());
+
   // Serve static UI files
   let uiPath = path.join(__dirname, '../ui');
   if (!fs.existsSync(uiPath)) {
@@ -24,9 +53,19 @@ export function createApp() {
   app.use(express.static(uiPath));
 
   // --- Job Endpoints ---
-  app.get('/api/v1/jobs', async (_req: Request, res: Response) => {
+  app.get('/api/v1/jobs', async (req: Request, res: Response) => {
     try {
-      const jobs = await cluster.getAllJobs();
+      let jobs = await cluster.getAllJobs();
+      const priority = req.query.priority as string;
+      const status = req.query.status as string;
+
+      if (priority) {
+        jobs = jobs.filter((j) => j.priority === priority);
+      }
+      if (status) {
+        jobs = jobs.filter((j) => j.status === status);
+      }
+
       res.json({ success: true, count: jobs.length, jobs });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message });
@@ -35,7 +74,7 @@ export function createApp() {
 
   app.post('/api/v1/jobs', async (req: Request, res: Response) => {
     try {
-      const { name, taskType, payload, priority, schedule, retryPolicy, timeoutMs } = req.body;
+      const { name, taskType, payload, priority, schedule, retryPolicy, timeoutMs, idempotencyKey } = req.body;
       if (!name || !schedule || !schedule.type) {
         return res.status(400).json({ success: false, error: 'Missing required fields: name, schedule.type' });
       }
@@ -48,6 +87,13 @@ export function createApp() {
         schedule,
         retryPolicy,
         timeoutMs,
+        idempotencyKey,
+      });
+
+      // Prometheus metrics tracking
+      jobsEnqueuedCounter.inc({
+        priority: job.priority,
+        task_type: job.taskType,
       });
 
       res.status(201).json({ success: true, job });

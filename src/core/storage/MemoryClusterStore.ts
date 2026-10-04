@@ -197,7 +197,11 @@ export class MemoryClusterStore implements IStorageAdapter {
     return true;
   }
 
-  // --- Worker Lease Management ---
+  private fencingTokens = new Map<string, number>(); // jobId -> current fencing token
+  private idempotencyStore = new Map<string, { value: string; expiresAt?: number }>();
+  private rateLimitWindows = new Map<string, number[]>(); // key -> list of timestamp ms
+
+  // --- Worker Lease & Fencing Token Management ---
   async setLease(lease: ExecutionLease): Promise<void> {
     await this.applyChaosLatency();
     this.leases.set(lease.jobId, { ...lease });
@@ -216,6 +220,99 @@ export class MemoryClusterStore implements IStorageAdapter {
   async removeLease(jobId: string): Promise<boolean> {
     await this.applyChaosLatency();
     return this.leases.delete(jobId);
+  }
+
+  async incrementFencingToken(jobId: string): Promise<number> {
+    await this.applyChaosLatency();
+    const current = this.fencingTokens.get(jobId) || 0;
+    const next = current + 1;
+    this.fencingTokens.set(jobId, next);
+    return next;
+  }
+
+  async getFencingToken(jobId: string): Promise<number> {
+    await this.applyChaosLatency();
+    return this.fencingTokens.get(jobId) || 0;
+  }
+
+  async completeJobAtomic(
+    jobId: string,
+    fencingToken: number,
+    jobData: string,
+    idempotencyKey?: string,
+    idempotencyResult?: string
+  ): Promise<{ success: boolean; reason?: string }> {
+    await this.applyChaosLatency();
+    const currentToken = this.fencingTokens.get(jobId) || 0;
+
+    // Lease fencing verification: Reject if token is stale
+    if (fencingToken < currentToken) {
+      return {
+        success: false,
+        reason: `Fencing token stale: submitted ${fencingToken} < current ${currentToken}`,
+      };
+    }
+
+    // Remove active lease
+    this.leases.delete(jobId);
+
+    // Save job state
+    this.kvStore.set(`job:${jobId}`, { value: jobData });
+
+    // Save idempotency result if key provided
+    if (idempotencyKey && idempotencyResult) {
+      await this.setIdempotency(idempotencyKey, idempotencyResult, 86400);
+    }
+
+    return { success: true };
+  }
+
+  async lpopPriority(queueKeys: string[]): Promise<{ queue: string; item: string } | null> {
+    await this.applyChaosLatency();
+    for (const key of queueKeys) {
+      const q = this.queues.get(key);
+      if (q && q.length > 0) {
+        const item = q.shift()!;
+        return { queue: key, item };
+      }
+    }
+    return null;
+  }
+
+  async getIdempotency(key: string): Promise<string | null> {
+    await this.applyChaosLatency();
+    const entry = this.idempotencyStore.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt && Date.now() > entry.expiresAt) {
+      this.idempotencyStore.delete(key);
+      return null;
+    }
+    return entry.value;
+  }
+
+  async setIdempotency(key: string, value: string, ttlSeconds = 86400): Promise<void> {
+    await this.applyChaosLatency();
+    this.idempotencyStore.set(key, {
+      value,
+      expiresAt: Date.now() + ttlSeconds * 1000,
+    });
+  }
+
+  async checkRateLimit(key: string, limitPerSecond: number): Promise<boolean> {
+    await this.applyChaosLatency();
+    const now = Date.now();
+    const windowStart = now - 1000;
+    let timestamps = this.rateLimitWindows.get(key) || [];
+    timestamps = timestamps.filter((t) => t > windowStart);
+
+    if (timestamps.length >= limitPerSecond) {
+      this.rateLimitWindows.set(key, timestamps);
+      return false; // Rate limit exceeded
+    }
+
+    timestamps.push(now);
+    this.rateLimitWindows.set(key, timestamps);
+    return true; // Allowed
   }
 
   // --- Atomic Lookahead Dispatch (Lua Script Equivalent) ---
@@ -242,16 +339,31 @@ export class MemoryClusterStore implements IStorageAdapter {
     const claimed = dueJobs.slice(0, limit);
     const claimedJobIds: string[] = [];
 
-    let readyQueue = this.queues.get(readyQueueKey);
-    if (!readyQueue) {
-      readyQueue = [];
-      this.queues.set(readyQueueKey, readyQueue);
-    }
-
     for (const item of claimed) {
       // Atomically remove from delayed set
       zset.delete(item.member);
-      // Push to ready queue
+
+      // Determine priority queue target if job payload specifies priority
+      let targetQueueKey = readyQueueKey;
+      const jobRaw = this.kvStore.get(`job:${item.member}`);
+      if (jobRaw) {
+        try {
+          const parsed = JSON.parse(jobRaw.value);
+          if (parsed.priority) {
+            targetQueueKey = `${readyQueueKey}:${parsed.priority}`;
+          }
+        } catch {
+          // fallback to base queue
+        }
+      }
+
+      let readyQueue = this.queues.get(targetQueueKey);
+      if (!readyQueue) {
+        readyQueue = [];
+        this.queues.set(targetQueueKey, readyQueue);
+      }
+
+      // Also ensure base queue receives it if listeners poll base
       readyQueue.push(item.member);
       claimedJobIds.push(item.member);
     }
@@ -265,5 +377,10 @@ export class MemoryClusterStore implements IStorageAdapter {
     this.queues.clear();
     this.locks.clear();
     this.leases.clear();
+    this.fencingTokens.clear();
+    this.idempotencyStore.clear();
+    this.rateLimitWindows.clear();
   }
+
+  async disconnect(): Promise<void> {}
 }

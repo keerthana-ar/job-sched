@@ -46,11 +46,15 @@ export class SchedulerNode {
     // Lookahead polling loop
     this.pollTimer = setInterval(async () => {
       if (!this.isRunning || this.info.status !== 'ACTIVE') return;
-      await this.pollAndDispatch();
+      while (this.isRunning && this.info.status === 'ACTIVE') {
+        const claimed = await this.pollAndDispatch();
+        if (claimed.length < this.batchSize) break;
+      }
     }, this.pollIntervalMs);
   }
 
   public async pollAndDispatch(): Promise<string[]> {
+    if (this.info.status !== 'ACTIVE') return [];
     try {
       const now = Date.now();
       // Atomic dispatch using Lua/CAS primitive on the storage engine
@@ -64,6 +68,7 @@ export class SchedulerNode {
 
       if (claimedJobIds.length > 0) {
         for (const jobId of claimedJobIds) {
+          if (this.info.status !== 'ACTIVE') break;
           // Update persistent job state
           const jobJson = await this.storage.get(`job:${jobId}`);
           if (jobJson) {

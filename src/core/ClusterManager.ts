@@ -1,5 +1,6 @@
 import { IStorageAdapter } from './storage/IStorageAdapter.js';
 import { MemoryClusterStore } from './storage/MemoryClusterStore.js';
+import { RedisStorageAdapter } from './storage/RedisStorageAdapter.js';
 import { SchedulerNode } from './scheduler/SchedulerNode.js';
 import { WorkerNode } from './worker/WorkerNode.js';
 import { ZombieReaper } from './recovery/ZombieReaper.js';
@@ -15,6 +16,7 @@ export interface CreateJobInput {
   schedule: JobSchedule;
   retryPolicy?: Partial<RetryPolicy>;
   timeoutMs?: number;
+  idempotencyKey?: string;
 }
 
 export class ClusterManager {
@@ -27,16 +29,29 @@ export class ClusterManager {
   private delayedZSetKey = 'queue:delayed_jobs';
   private dlqKey = 'queue:dead_letter';
 
-  private constructor() {
-    this.storage = new MemoryClusterStore();
+  private constructor(customStorage?: IStorageAdapter) {
+    if (customStorage) {
+      this.storage = customStorage;
+    } else if (process.env.REDIS_URL || process.env.USE_REDIS === 'true') {
+      this.storage = new RedisStorageAdapter(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
+    } else {
+      this.storage = new MemoryClusterStore();
+    }
     this.reaper = new ZombieReaper(this.storage, 1500);
   }
 
-  public static getInstance(): ClusterManager {
+  public static getInstance(customStorage?: IStorageAdapter): ClusterManager {
     if (!ClusterManager.instance) {
-      ClusterManager.instance = new ClusterManager();
+      ClusterManager.instance = new ClusterManager(customStorage);
+    } else if (customStorage && ClusterManager.instance.storage !== customStorage) {
+      ClusterManager.instance.storage = customStorage;
+      ClusterManager.instance.reaper = new ZombieReaper(customStorage, 1500);
     }
     return ClusterManager.instance;
+  }
+
+  public static resetInstance(): void {
+    ClusterManager.instance = undefined as any;
   }
 
   public async bootstrap(options: { schedulerCount?: number; workerCount?: number } = {}): Promise<void> {
@@ -103,6 +118,7 @@ export class ClusterManager {
       nextRunTime,
       createdAt: now,
       updatedAt: now,
+      idempotencyKey: input.idempotencyKey || input.payload?.idempotencyKey,
       executionHistory: [],
     };
 

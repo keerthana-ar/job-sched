@@ -85,7 +85,9 @@ export class RetryManager {
     executionRecord: JobExecutionRecord
   ): Promise<void> {
     job.updatedAt = Date.now();
-    job.executionHistory.push(executionRecord);
+    if (!job.executionHistory.some((e) => e.id === executionRecord.id)) {
+      job.executionHistory.push(executionRecord);
+    }
 
     if (job.schedule.type === 'CRON' && job.schedule.cronExpr) {
       try {

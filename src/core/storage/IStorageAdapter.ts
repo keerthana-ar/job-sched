@@ -31,11 +31,35 @@ export interface IStorageAdapter {
   releaseLock(lockKey: string, ownerId: string): Promise<boolean>;
   renewLock(lockKey: string, ownerId: string, ttlMs: number): Promise<boolean>;
 
-  // Worker Lease Management
+  // Worker Lease & Fencing Token Management
   setLease(lease: ExecutionLease): Promise<void>;
   getLease(jobId: string): Promise<ExecutionLease | null>;
   getAllLeases(): Promise<ExecutionLease[]>;
   removeLease(jobId: string): Promise<boolean>;
+  incrementFencingToken(jobId: string): Promise<number>;
+  getFencingToken(jobId: string): Promise<number>;
+
+  // Atomic Job Completion with Fencing Token Verification
+  // Atomically verifies that worker's fencingToken >= current active fencingToken.
+  // If stale, write is rejected, preventing zombie workers from overwriting newer execution state.
+  completeJobAtomic(
+    jobId: string,
+    fencingToken: number,
+    jobData: string,
+    idempotencyKey?: string,
+    idempotencyResult?: string
+  ): Promise<{ success: boolean; reason?: string }>;
+
+  // Priority Queue Pop
+  // Checks queues in order (e.g. CRITICAL -> HIGH -> NORMAL -> LOW)
+  lpopPriority(queueKeys: string[]): Promise<{ queue: string; item: string } | null>;
+
+  // Idempotency Store
+  getIdempotency(key: string): Promise<string | null>;
+  setIdempotency(key: string, value: string, ttlSeconds?: number): Promise<void>;
+
+  // Sliding Window Rate Limiting (Token Bucket / Window per queue)
+  checkRateLimit(key: string, limitPerSecond: number): Promise<boolean>;
 
   // Atomic Scheduler Lookahead Dispatch (Lua Script equivalent)
   // Atomically pops jobs with score <= now from delayed ZSET, changes their status to DISPATCHED,
@@ -48,6 +72,7 @@ export interface IStorageAdapter {
     schedulerId: string
   ): Promise<string[]>;
 
-  // Reset / Clear
+  // Reset / Clear / Lifecycle
   clear(): Promise<void>;
+  disconnect?(): Promise<void>;
 }

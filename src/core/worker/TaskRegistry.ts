@@ -22,8 +22,10 @@ export class TaskRegistry {
 
 // Register built-in realistic handlers
 TaskRegistry.register('DATA_PROCESSING', async (job: Job) => {
-  const duration = job.payload.durationMs || 1200;
-  await new Promise((resolve) => setTimeout(resolve, duration));
+  const duration = job.payload.durationMs ?? 1200;
+  if (duration > 0) {
+    await new Promise((resolve) => setTimeout(resolve, duration));
+  }
   return {
     result: {
       recordsProcessed: job.payload.batchSize || 1500,
@@ -33,8 +35,10 @@ TaskRegistry.register('DATA_PROCESSING', async (job: Job) => {
 });
 
 TaskRegistry.register('HTTP_WEBHOOK', async (job: Job) => {
-  const duration = job.payload.latencyMs || 600;
-  await new Promise((resolve) => setTimeout(resolve, duration));
+  const duration = job.payload.latencyMs ?? 600;
+  if (duration > 0) {
+    await new Promise((resolve) => setTimeout(resolve, duration));
+  }
   if (job.payload.forceFail) {
     throw new Error(`HTTP 502 Bad Gateway: Downstream service at ${job.payload.url || 'https://api.gateway.internal'} unavailable`);
   }
@@ -47,7 +51,10 @@ TaskRegistry.register('HTTP_WEBHOOK', async (job: Job) => {
 });
 
 TaskRegistry.register('EMAIL_DISPATCH', async (job: Job) => {
-  await new Promise((resolve) => setTimeout(resolve, 400));
+  const duration = job.payload.durationMs ?? 400;
+  if (duration > 0) {
+    await new Promise((resolve) => setTimeout(resolve, duration));
+  }
   return {
     result: {
       messageId: 'msg_' + Math.random().toString(36).substring(2, 10),
@@ -57,8 +64,11 @@ TaskRegistry.register('EMAIL_DISPATCH', async (job: Job) => {
   };
 });
 
-TaskRegistry.register('DB_CLEANUP', async () => {
-  await new Promise((resolve) => setTimeout(resolve, 800));
+TaskRegistry.register('DB_CLEANUP', async (job: Job) => {
+  const duration = job.payload.durationMs ?? 800;
+  if (duration > 0) {
+    await new Promise((resolve) => setTimeout(resolve, duration));
+  }
   return {
     result: {
       purgedRows: Math.floor(Math.random() * 500) + 50,
@@ -71,8 +81,10 @@ TaskRegistry.register('DB_CLEANUP', async () => {
 // If configured with failUntilAttempt = 3, attempts 1 & 2 fail with error, attempt 3 succeeds!
 TaskRegistry.register('FLAKY_TASK', async (job: Job) => {
   const failUntil = job.payload.failUntilAttempt ?? 2;
-  const duration = job.payload.durationMs || 500;
-  await new Promise((resolve) => setTimeout(resolve, duration));
+  const duration = job.payload.durationMs ?? 500;
+  if (duration > 0) {
+    await new Promise((resolve) => setTimeout(resolve, duration));
+  }
 
   if (job.currentAttempt < failUntil) {
     throw new Error(`Downstream RateLimitExceeded: attempt ${job.currentAttempt} of ${failUntil} rejected with 429`);
